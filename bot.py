@@ -24,23 +24,30 @@ from games import tictactoe, rps, dice, battleship, connect4, reflex, shell, han
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gamebot")
 
-def _require_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(
-            f"Переменная окружения {name} не задана. "
-            f"Проверьте Render → Environment → {name}."
-        )
-    return value
-
-
-BOT_TOKEN = _require_env("BOT_TOKEN")
-WEBHOOK_HOST = _require_env("WEBHOOK_URL").rstrip("/")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+WEBHOOK_HOST = os.environ["WEBHOOK_URL"].rstrip("/")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 PORT = int(os.environ.get("PORT", 10000))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+
+def _answer_bg(cq: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
+    """Отвечает на callback в фоне, не блокируя дальнейшую обработку хода.
+
+    cq.answer() и bot.edit_message_text() — независимые сетевые запросы к Telegram,
+    поэтому не обязательно ждать первый перед тем, как готовить и отправлять второй.
+    Это небольшая, но заметная оптимизация скорости отклика во всех играх.
+    """
+
+    async def _runner():
+        try:
+            await cq.answer(text, show_alert=show_alert)
+        except Exception:
+            pass
+
+    asyncio.create_task(_runner())
 
 
 # ---------- /start ----------
@@ -281,7 +288,7 @@ async def ttt_move(cq: CallbackQuery):
     else:
         state["turn_id"] = state["p2_id"] if cq.from_user.id == state["p1_id"] else state["p1_id"]
 
-    await cq.answer()
+    _answer_bg(cq)
     keyboard = tictactoe.build_keyboard(state["board"])
     await _end_round_or_finish(cq.inline_message_id, state, "ttt", suffix, tictactoe.build_text, keyboard)
 
@@ -305,7 +312,7 @@ async def rps_move(cq: CallbackQuery):
         return
 
     picks[cq.from_user.id] = pick
-    await cq.answer(f"Ты выбрал(а) {rps.EMOJI[pick]}")
+    _answer_bg(cq, f"Ты выбрал(а) {rps.EMOJI[pick]}")
 
     if len(picks) < 2:
         storage.set(cq.inline_message_id, state)
@@ -361,7 +368,7 @@ async def dice_move(cq: CallbackQuery):
 
     value = dice.roll()
     rolls[cq.from_user.id] = value
-    await cq.answer(f"Выпало: {value}")
+    _answer_bg(cq, f"Выпало: {value}")
 
     if len(rolls) < 2:
         storage.set(cq.inline_message_id, state)
@@ -422,10 +429,11 @@ async def battleship_move(cq: CallbackQuery):
         return
 
     suffix = ""
-    if idx in bs["ships"][defender_id]:
-        bs["shots"][attacker_id][idx] = "hit"
+    is_hit = idx in bs["ships"][defender_id]
+    if is_hit:
         bs["ships"][defender_id].discard(idx)
-        await cq.answer("Попадание! 🔥")
+        battleship.register_shot(bs, attacker_id, idx, True)
+        _answer_bg(cq, "Попадание! 🚢 Стреляй ещё раз")
         if not bs["ships"][defender_id]:
             attacker_name = state["p1_name"] if attacker_id == state["p1_id"] else state["p2_name"]
             state["score"][attacker_id] += 1
@@ -434,11 +442,10 @@ async def battleship_move(cq: CallbackQuery):
             if not finished:
                 _init_round(state, "bs")
                 bs = state["battleship"]  # ссылка на локальную переменную устарела после ре-инициализации
-        else:
-            state["turn_id"] = defender_id
+        # при попадании (флот ещё жив) ход остаётся у того же игрока
     else:
-        bs["shots"][attacker_id][idx] = "miss"
-        await cq.answer("Мимо 💦")
+        battleship.register_shot(bs, attacker_id, idx, False)
+        _answer_bg(cq, "Мимо ❌")
         state["turn_id"] = defender_id
 
     keyboard = battleship.build_keyboard(bs, state["turn_id"])
@@ -470,7 +477,7 @@ async def connect4_move(cq: CallbackQuery):
 
     winner_symbol = connect4.check_winner(board)
     suffix = ""
-    await cq.answer()
+    _answer_bg(cq)
 
     if winner_symbol:
         winner_id = state["p1_id"] if winner_symbol == "X" else state["p2_id"]
@@ -515,14 +522,14 @@ async def shell_move(cq: CallbackQuery):
     if idx == sh["secret"]:
         winner_name = state["p1_name"] if cq.from_user.id == state["p1_id"] else state["p2_name"]
         state["score"][cq.from_user.id] += 1
-        await cq.answer("Есть! 🎯")
+        _answer_bg(cq, "Есть! 🎯")
         suffix = f"\n\n🎉 <b>{winner_name}</b> нашёл(нашла) шарик! Новый раунд."
         finished, _ = _finish_check(state)
         if not finished:
             _init_round(state, "shell")
     else:
         sh["revealed_empty"].add(idx)
-        await cq.answer("Пусто 😔")
+        _answer_bg(cq, "Пусто 😔")
         state["turn_id"] = state["p2_id"] if cq.from_user.id == state["p1_id"] else state["p1_id"]
 
     keyboard = shell.build_keyboard(state["shell"])
@@ -555,7 +562,7 @@ async def hangman_move(cq: CallbackQuery):
     guesser_name = state["p1_name"] if cq.from_user.id == state["p1_id"] else state["p2_name"]
 
     if letter in hm["word"]:
-        await cq.answer("Есть такая буква! ✅")
+        _answer_bg(cq, "Есть такая буква! ✅")
         if all(ch in hm["guessed"] for ch in hm["word"]):
             state["score"][cq.from_user.id] += 1
             suffix = f"\n\n🎉 Слово «{hm['word']}» отгадано игроком <b>{guesser_name}</b>! Новый раунд."
@@ -565,7 +572,7 @@ async def hangman_move(cq: CallbackQuery):
         # если слово не отгадано полностью — тот же игрок ходит снова
     else:
         hm["wrong"] += 1
-        await cq.answer("Такой буквы нет ❌")
+        _answer_bg(cq, "Такой буквы нет ❌")
         if hm["wrong"] >= hangman.MAX_WRONG:
             opponent_id = state["p2_id"] if cq.from_user.id == state["p1_id"] else state["p1_id"]
             opponent_name = state["p1_name"] if opponent_id == state["p1_id"] else state["p2_name"]
@@ -602,7 +609,7 @@ async def math_move(cq: CallbackQuery):
     if md["options"][idx] == md["correct"]:
         winner_name = state["p1_name"] if cq.from_user.id == state["p1_id"] else state["p2_name"]
         state["score"][cq.from_user.id] += 1
-        await cq.answer("Верно! ⚡")
+        _answer_bg(cq, "Верно! ⚡")
         suffix = f"\n\n🎉 <b>{winner_name}</b> ответил(а) первым(ой)! Новый раунд."
         finished, _ = _finish_check(state)
         if not finished:
@@ -611,7 +618,7 @@ async def math_move(cq: CallbackQuery):
         await _end_round_or_finish(cq.inline_message_id, state, "math", suffix, mathduel.build_text, keyboard)
     else:
         md["eliminated"].add(idx)
-        await cq.answer("Неверно ❌", show_alert=True)
+        _answer_bg(cq, "Неверно ❌", show_alert=True)
         storage.set(cq.inline_message_id, state)
         await bot.edit_message_text(
             mathduel.build_text(state), inline_message_id=cq.inline_message_id,
@@ -666,7 +673,7 @@ async def memory_move(cq: CallbackQuery):
         return
 
     mem["pending"].append(idx)
-    await cq.answer()
+    _answer_bg(cq)
 
     if len(mem["pending"]) == 1:
         storage.set(cq.inline_message_id, state)
@@ -756,11 +763,11 @@ async def reflex_press(cq: CallbackQuery):
     if state.get("armed"):
         winner_id, winner_name = cq.from_user.id, presser_name
         suffix = f"\n\n⚡ <b>{winner_name}</b> оказался(ась) быстрее!"
-        await cq.answer("Ты быстрее! ⚡")
+        _answer_bg(cq, "Ты быстрее! ⚡")
     else:
         winner_id, winner_name = opponent_id, opponent_name
         suffix = f"\n\n🐌 <b>{presser_name}</b> поспешил(а) — раунд достаётся <b>{winner_name}</b>!"
-        await cq.answer("Рано! Фальстарт 🐌", show_alert=True)
+        _answer_bg(cq, "Рано! Фальстарт 🐌", show_alert=True)
 
     state["score"][winner_id] += 1
     storage.set(cq.inline_message_id, state)
@@ -786,38 +793,11 @@ async def reflex_press(cq: CallbackQuery):
 # ---------- запуск через webhook (для Render) ----------
 
 async def on_startup(bot: Bot):
-    """
-    Устанавливаем webhook с ретраями: на бесплатном Render в первые секунды
-    холодного старта сеть иногда отвечает не сразу. Раньше при любом сбое
-    здесь падало исключение ДО того, как поднимался HTTP-сервер (web.run_app),
-    из-за чего процесс целиком крашился и Render отдавал 502 на все запросы
-    (включая /health) — сервис не "спал", а не мог стартовать вообще, поэтому
-    пинги от UptimeRobot не помогали.
-    """
-    url = WEBHOOK_HOST + WEBHOOK_PATH
-    attempts = 5
-    for attempt in range(1, attempts + 1):
-        try:
-            await bot.set_webhook(
-                url,
-                allowed_updates=["message", "inline_query", "chosen_inline_result", "callback_query"],
-            )
-            log.info("Webhook установлен: %s", url)
-            return
-        except Exception:
-            log.exception(
-                "Не удалось установить webhook (попытка %s/%s)", attempt, attempts
-            )
-            if attempt == attempts:
-                # Даже если не получилось — не роняем процесс. Сервер всё равно
-                # поднимется и будет отвечать на /health, а вебхук можно
-                # переустановить позже (в т.ч. вручную через getWebhookInfo/setWebhook).
-                log.error(
-                    "Продолжаю запуск без установленного webhook. "
-                    "Проверьте BOT_TOKEN и WEBHOOK_URL в переменных окружения Render."
-                )
-                return
-            await asyncio.sleep(min(2 ** attempt, 30))
+    await bot.set_webhook(
+        WEBHOOK_HOST + WEBHOOK_PATH,
+        allowed_updates=["message", "inline_query", "chosen_inline_result", "callback_query"],
+    )
+    log.info("Webhook установлен: %s", WEBHOOK_HOST + WEBHOOK_PATH)
 
 
 async def health(request):
@@ -828,7 +808,6 @@ def main():
     dp.startup.register(on_startup)
 
     app = web.Application()
-    app.router.add_get("/", health)
     app.router.add_get("/health", health)
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
